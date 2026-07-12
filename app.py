@@ -5,10 +5,12 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, r2_score, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score
 import xgboost as xgb
 import warnings
 warnings.filterwarnings('ignore')
@@ -20,56 +22,121 @@ st.title("🏥 Diabetes Prediction Model")
 st.markdown("---")
 
 # ============ DATA PATH (RELATIVE — WORKS ON STREAMLIT CLOUD) ============
-# On GitHub/Streamlit Cloud there is no G: drive, so we use a path relative
-# to this script. Put your CSV at: <repo_root>/data/diabetes_dataset.csv
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_PATH = os.path.join(APP_DIR, "data", "diabetes_dataset.csv")
 
-REQUIRED_COLUMNS = [
-    "Pregnancies", "Glucose", "BloodPressure", "SkinThickness",
-    "Insulin", "BMI", "DiabetesPedigreeFunction", "Age", "Outcome"
+# Columns most likely to be the prediction target, in priority order
+TARGET_CANDIDATES = [
+    "diagnosed_diabetes", "Outcome", "diabetic", "Diabetic", "target", "Diagnosis"
 ]
+
+# Columns that are usually *derived from* the diagnosis itself — including
+# them as model inputs would leak the answer and make accuracy misleadingly
+# high. We exclude them by default but let the user override.
+LIKELY_LEAKAGE_COLUMNS = ["diabetes_risk_score", "diabetes_stage"]
 
 
 @st.cache_data
 def load_data(path):
-    """Load and lightly validate the dataset. Cached so it only runs once."""
+    """Load the dataset. Cached so it only runs once."""
     if not os.path.exists(path):
-        return None
-    df = pd.read_csv(path)
-    return df
+        return None, "not_found"
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None, "parse_error"
+
+    if df.shape[1] == 1:
+        try:
+            df = pd.read_csv(path, sep=None, engine="python")
+        except Exception:
+            pass
+
+    df.columns = [c.strip() for c in df.columns]
+    return df, "ok"
 
 
-def validate_columns(df):
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    return missing
+def show_debug_info(path):
+    """Self-diagnosing helper for missing/corrupt dataset issues."""
+    with st.expander("🔧 Debug info (click to expand)"):
+        st.write("**Expected path:**", path)
+        st.write("**App directory:**", APP_DIR)
+        try:
+            st.code("\n".join(sorted(os.listdir(APP_DIR))))
+        except Exception as e:
+            st.write(f"Could not list app directory: {e}")
+
+        data_dir = os.path.join(APP_DIR, "data")
+        if os.path.isdir(data_dir):
+            entries = sorted(os.listdir(data_dir))
+            st.code("\n".join(entries) if entries else "(empty folder)")
+            csv_path = os.path.join(data_dir, "diabetes_dataset.csv")
+            if os.path.exists(csv_path):
+                size_kb = os.path.getsize(csv_path) / 1024
+                st.write(f"**diabetes_dataset.csv size:** {size_kb:.1f} KB")
+                if size_kb < 5:
+                    st.warning(
+                        "⚠️ Suspiciously small for a large dataset — likely a "
+                        "Git LFS pointer file rather than the real CSV."
+                    )
+        else:
+            st.code("(no 'data' folder found here)")
 
 
-# Load once, reused across all pages
-df = load_data(DATASET_PATH)
+def normalize_target(y_raw):
+    """
+    Convert a target column of unknown type (bool, Yes/No, True/False,
+    0/1, or arbitrary categories) into clean 0/1 integer labels.
+    Returns (y, label_map) where label_map explains what 1 means.
+    """
+    if y_raw.dtype == bool:
+        return y_raw.astype(int), {0: "False", 1: "True"}
+
+    if pd.api.types.is_numeric_dtype(y_raw):
+        uniques = sorted(y_raw.dropna().unique().tolist())
+        if set(uniques) <= {0, 1}:
+            return y_raw.astype(int), {0: "0", 1: "1"}
+        # Numeric but not already 0/1 (e.g. a risk score) — not ideal as a
+        # classification target, but binarize around the median as a fallback.
+        median = y_raw.median()
+        return (y_raw > median).astype(int), {0: f"<= {median}", 1: f"> {median}"}
+
+    # String/object column — map common yes/no style values
+    lower_map = {str(v).strip().lower(): v for v in y_raw.dropna().unique()}
+    positive_words = {"yes", "true", "diabetic", "1", "positive", "diagnosed"}
+    negative_words = {"no", "false", "non-diabetic", "nondiabetic", "0", "negative"}
+
+    if set(lower_map.keys()) <= (positive_words | negative_words):
+        y = y_raw.astype(str).str.strip().str.lower().map(
+            lambda v: 1 if v in positive_words else 0
+        )
+        return y, {0: "negative", 1: "positive"}
+
+    # Fallback: generic label encoding (works for any category set, but
+    # only makes sense for genuinely binary targets)
+    codes, uniques = pd.factorize(y_raw)
+    label_map = {i: str(u) for i, u in enumerate(uniques)}
+    return pd.Series(codes, index=y_raw.index), label_map
+
+
+# ============ LOAD DATA ============
+df, load_status = load_data(DATASET_PATH)
 
 # ============ SIDEBAR NAVIGATION ============
 page = st.sidebar.radio("Select Page:", ["Home", "Data Analysis", "Model Training", "Make Prediction"])
 
-# Friendly, actionable error if the CSV isn't where it should be —
-# this is the #1 reason this kind of app breaks on Streamlit Cloud.
 if df is None:
-    st.error(
-        f"⚠️ Dataset not found at `data/diabetes_dataset.csv`.\n\n"
-        f"Make sure your GitHub repo looks like this:\n\n"
-        f"```\n"
-        f"your-repo/\n"
-        f"├── app.py\n"
-        f"├── requirements.txt\n"
-        f"└── data/\n"
-        f"    └── diabetes_dataset.csv\n"
-        f"```"
-    )
-    st.stop()
-
-missing_cols = validate_columns(df)
-if missing_cols:
-    st.error(f"⚠️ Dataset is missing expected columns: {missing_cols}")
+    if load_status == "parse_error":
+        st.error(
+            "⚠️ Found `data/diabetes_dataset.csv` but couldn't parse it as a CSV. "
+            "It may be corrupted or an unresolved Git LFS pointer file."
+        )
+    else:
+        st.error(
+            "⚠️ Dataset not found at `data/diabetes_dataset.csv`. Check that it's "
+            "committed to your repo at that exact path."
+        )
+    show_debug_info(DATASET_PATH)
     st.stop()
 
 # ============ HOME PAGE ============
@@ -77,110 +144,119 @@ if page == "Home":
     st.header("Welcome!")
     st.markdown("""
     ### What This App Does:
-    - 📊 Loads the diabetes dataset
+    - 📊 Loads your diabetes risk dataset
     - 🎯 Trains multiple ML classification models
     - 📈 Compares model performance
-    - 🔮 Predicts diabetes outcome for new patients
+    - 🔮 Predicts diabetes diagnosis for a new patient profile
 
-    👉 Start with **Data Analysis**, then go to **Model Training**,
-    and finally use **Make Prediction**.
+    👉 Start with **Data Analysis**, then **Model Training**, then **Make Prediction**.
     """)
     st.info(f"Dataset currently loaded: **{df.shape[0]} rows, {df.shape[1]} columns**")
+    st.write("**Columns:**")
+    st.code(", ".join(df.columns))
 
 # ============ DATA ANALYSIS PAGE ============
 elif page == "Data Analysis":
     st.header("📊 Data Analysis")
-
-    st.success(f"✅ Dataset loaded: {df.shape[0]} rows")
+    st.success(f"✅ Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
 
     if st.checkbox("Show dataset"):
         st.dataframe(df.head(10))
 
     st.subheader("Statistics")
-    st.dataframe(df.describe())
+    st.dataframe(df.describe(include="all"))
 
-    st.subheader("Outcome Distribution")
-    col1, col2 = st.columns(2)
-    with col1:
-        fig, ax = plt.subplots()
-        df["Outcome"].value_counts().plot(kind="bar", ax=ax, color=["#4C72B0", "#DD8452"])
-        ax.set_xticklabels(["Not Diabetic (0)", "Diabetic (1)"], rotation=0)
-        ax.set_ylabel("Count")
+    target_guess = next((c for c in TARGET_CANDIDATES if c in df.columns), None)
+    if target_guess:
+        st.subheader(f"Target Distribution: `{target_guess}`")
+        st.write(df[target_guess].value_counts())
+
+    st.subheader("Numeric Feature Correlation")
+    numeric_df = df.select_dtypes(include=np.number)
+    if numeric_df.shape[1] >= 2:
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sns.heatmap(numeric_df.corr(), cmap="coolwarm", center=0, ax=ax)
         st.pyplot(fig)
-    with col2:
-        st.write(df["Outcome"].value_counts())
-
-    st.subheader("Feature Correlation")
-    fig2, ax2 = plt.subplots(figsize=(8, 6))
-    sns.heatmap(df.corr(numeric_only=True), annot=True, fmt=".2f", cmap="coolwarm", ax=ax2)
-    st.pyplot(fig2)
+    else:
+        st.info("Not enough numeric columns for a correlation heatmap.")
 
 # ============ MODEL TRAINING PAGE ============
 elif page == "Model Training":
     st.header("🤖 Model Training")
 
-    X = df.drop("Outcome", axis=1)
-    y = df["Outcome"]
+    default_target = next((c for c in TARGET_CANDIDATES if c in df.columns), df.columns[-1])
+    target_col = st.selectbox(
+        "Target column (what to predict)",
+        options=list(df.columns),
+        index=list(df.columns).index(default_target),
+    )
 
-    # Encode any categorical columns (Pima dataset usually has none, but this
-    # keeps the app generic/robust if you swap in a different CSV)
+    leakage_present = [c for c in LIKELY_LEAKAGE_COLUMNS if c in df.columns and c != target_col]
+    exclude_leakage = True
+    if leakage_present:
+        st.warning(
+            f"⚠️ These columns look like they may be **derived from the diagnosis** "
+            f"(data leakage): `{', '.join(leakage_present)}`. Including them will "
+            f"make accuracy look unrealistically high."
+        )
+        exclude_leakage = st.checkbox("Exclude these from training (recommended)", value=True)
+
+    exclude_cols = [target_col] + (leakage_present if exclude_leakage else [])
+    X = df.drop(columns=exclude_cols)
+    y_raw = df[target_col]
+    y, label_map = normalize_target(y_raw)
+
+    st.caption(f"Target normalized to: {label_map}")
+
     categorical_cols = X.select_dtypes(include="object").columns.tolist()
-    X_encoded = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
-    feature_columns = X_encoded.columns.tolist()  # remember for prediction page
+    numerical_cols = X.select_dtypes(include=np.number).columns.tolist()
+    st.write(f"**Numerical features ({len(numerical_cols)}):** {', '.join(numerical_cols) or 'none'}")
+    st.write(f"**Categorical features ({len(categorical_cols)}):** {', '.join(categorical_cols) or 'none'}")
 
     test_size = st.slider("Test set size", 0.1, 0.4, 0.2, 0.05)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_encoded, y, test_size=test_size, random_state=42, stratify=y
-    )
-
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    preprocessor = ColumnTransformer(transformers=[
+        ("num", StandardScaler(), numerical_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols),
+    ])
 
     if st.button("🚀 Train Models", use_container_width=True):
         with st.spinner("Training models..."):
-            # Logistic Regression (replaces SGDRegressor — this is a
-            # classification problem since Outcome is 0/1)
-            log_reg = LogisticRegression(max_iter=1000, random_state=42)
-            log_reg.fit(X_train_scaled, y_train)
-            log_acc = accuracy_score(y_test, log_reg.predict(X_test_scaled))
-
-            # Random Forest Classifier
-            rf = RandomForestClassifier(n_estimators=200, random_state=42)
-            rf.fit(X_train_scaled, y_train)
-            rf_acc = accuracy_score(y_test, rf.predict(X_test_scaled))
-
-            # XGBoost Classifier
-            xgb_model = xgb.XGBClassifier(
-                n_estimators=200, random_state=42, eval_metric="logloss"
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=42, stratify=y
             )
-            xgb_model.fit(X_train_scaled, y_train)
-            xgb_acc = accuracy_score(y_test, xgb_model.predict(X_test_scaled))
+
+            models = {
+                "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
+                "Random Forest": RandomForestClassifier(n_estimators=150, random_state=42, n_jobs=-1),
+                "XGBoost": xgb.XGBClassifier(n_estimators=150, random_state=42, eval_metric="logloss", n_jobs=-1),
+            }
+
+            trained_pipelines = {}
+            accuracies = {}
+            for name, model in models.items():
+                pipe = Pipeline([("preprocess", preprocessor), ("model", model)])
+                pipe.fit(X_train, y_train)
+                acc = accuracy_score(y_test, pipe.predict(X_test))
+                trained_pipelines[name] = pipe
+                accuracies[name] = acc
 
         st.success("✅ Models trained!")
 
         results = pd.DataFrame({
-            "Model": ["Logistic Regression", "Random Forest", "XGBoost"],
-            "Accuracy": [log_acc, rf_acc, xgb_acc],
+            "Model": list(accuracies.keys()),
+            "Accuracy": list(accuracies.values()),
         }).sort_values("Accuracy", ascending=False).reset_index(drop=True)
-
         st.dataframe(results, use_container_width=True)
+        st.info(f"🏆 Best model: **{results.iloc[0]['Model']}** (Accuracy: {results.iloc[0]['Accuracy']:.3f})")
 
-        best_row = results.iloc[0]
-        st.info(f"🏆 Best model: **{best_row['Model']}** (Accuracy: {best_row['Accuracy']:.3f})")
-
-        models = {
-            "Logistic Regression": log_reg,
-            "Random Forest": rf,
-            "XGBoost": xgb_model,
-        }
-
-        # Persist everything the Prediction page needs across reruns
-        st.session_state["trained_models"] = models
-        st.session_state["scaler"] = scaler
-        st.session_state["feature_columns"] = feature_columns
+        st.session_state["trained_pipelines"] = trained_pipelines
         st.session_state["results"] = results
+        st.session_state["feature_columns"] = X.columns.tolist()
+        st.session_state["categorical_cols"] = categorical_cols
+        st.session_state["numerical_cols"] = numerical_cols
+        st.session_state["label_map"] = label_map
+        st.session_state["X_reference"] = X  # for building prediction widgets
 
     elif "results" in st.session_state:
         st.info("Showing results from the last training run:")
@@ -190,64 +266,52 @@ elif page == "Model Training":
 elif page == "Make Prediction":
     st.header("🔮 Make Predictions")
 
-    if "trained_models" not in st.session_state:
+    if "trained_pipelines" not in st.session_state:
         st.warning("⚠️ No trained model found yet. Please go to **Model Training** and click 'Train Models' first.")
         st.stop()
 
-    model_name = st.selectbox("Choose model", list(st.session_state["trained_models"].keys()))
+    model_name = st.selectbox("Choose model", list(st.session_state["trained_pipelines"].keys()))
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        pregnancies = st.number_input("Pregnancies", min_value=0, max_value=17, value=0)
-    with col2:
-        glucose = st.number_input("Glucose", min_value=0, max_value=300, value=120)
-    with col3:
-        bp = st.number_input("Blood Pressure", min_value=0, max_value=200, value=80)
-    with col4:
-        skin = st.number_input("Skin Thickness", min_value=0, max_value=100, value=20)
+    X_ref = st.session_state["X_reference"]
+    categorical_cols = st.session_state["categorical_cols"]
+    numerical_cols = st.session_state["numerical_cols"]
+    label_map = st.session_state["label_map"]
 
-    col5, col6, col7, col8 = st.columns(4)
-    with col5:
-        insulin = st.number_input("Insulin", min_value=0, max_value=1000, value=79)
-    with col6:
-        bmi = st.number_input("BMI", min_value=0.0, max_value=60.0, value=32.0)
-    with col7:
-        dpf = st.number_input("Diabetes Pedigree Function", min_value=0.0, max_value=2.5, value=0.5)
-    with col8:
-        age = st.number_input("Age", min_value=0, max_value=120, value=33)
+    st.caption("Fill in patient details below. Fields are generated from your dataset's actual columns.")
+
+    inputs = {}
+    all_cols = st.session_state["feature_columns"]
+    cols_per_row = 4
+    for i in range(0, len(all_cols), cols_per_row):
+        row_cols = st.columns(cols_per_row)
+        for j, col_name in enumerate(all_cols[i:i + cols_per_row]):
+            with row_cols[j]:
+                if col_name in categorical_cols:
+                    options = sorted(X_ref[col_name].dropna().unique().tolist())
+                    inputs[col_name] = st.selectbox(col_name, options)
+                else:
+                    col_data = X_ref[col_name].dropna()
+                    default_val = float(col_data.median()) if len(col_data) else 0.0
+                    inputs[col_name] = st.number_input(
+                        col_name,
+                        value=default_val,
+                        format="%.3f",
+                    )
 
     if st.button("🔍 Predict", use_container_width=True):
-        input_df = pd.DataFrame([{
-            "Pregnancies": pregnancies,
-            "Glucose": glucose,
-            "BloodPressure": bp,
-            "SkinThickness": skin,
-            "Insulin": insulin,
-            "BMI": bmi,
-            "DiabetesPedigreeFunction": dpf,
-            "Age": age,
-        }])
+        input_df = pd.DataFrame([inputs])[all_cols]
+        pipe = st.session_state["trained_pipelines"][model_name]
 
-        # Align columns with what the model was trained on
-        feature_columns = st.session_state["feature_columns"]
-        input_df = input_df.reindex(columns=feature_columns, fill_value=0)
+        prediction = pipe.predict(input_df)[0]
+        proba = None
+        if hasattr(pipe, "predict_proba"):
+            proba = pipe.predict_proba(input_df)[0][1]
 
-        scaler = st.session_state["scaler"]
-        model = st.session_state["trained_models"][model_name]
-
-        input_scaled = scaler.transform(input_df)
-        prediction = model.predict(input_scaled)[0]
-
-        # Probability, if the model supports it (all three here do)
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(input_scaled)[0][1]
-        else:
-            proba = None
-
+        result_label = label_map.get(prediction, str(prediction))
         if prediction == 1:
-            st.error(f"⚠️ Prediction: **Diabetic**" + (f" (probability: {proba:.1%})" if proba is not None else ""))
+            st.error(f"⚠️ Prediction: **{result_label}**" + (f" (probability: {proba:.1%})" if proba is not None else ""))
         else:
-            st.success(f"✅ Prediction: **Not Diabetic**" + (f" (probability of diabetes: {proba:.1%})" if proba is not None else ""))
+            st.success(f"✅ Prediction: **{result_label}**" + (f" (probability of positive class: {proba:.1%})" if proba is not None else ""))
 
 # ============ FOOTER ============
 st.markdown("---")
