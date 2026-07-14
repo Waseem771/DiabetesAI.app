@@ -15,7 +15,7 @@ Rather than hardcoding column names, the pipeline is **schema-aware**: it automa
 
 ### Why this matters
 
-The raw dataset includes two columns — `diabetes_risk_score` and `diabetes_stage` — that are derived *from* the diagnosis itself rather than being independent predictors. Training on them inflates accuracy to a meaningless ~99%+. This app detects and excludes them by default, which is why the reported accuracy below is realistic rather than misleading.
+The raw dataset includes two columns — `diabetes_risk_score` and `diabetes_stage` — that are derived _from_ the diagnosis itself rather than being independent predictors. Training on them inflates accuracy to a meaningless ~99%+. This app detects and excludes them by default, which is why the reported accuracy below is realistic rather than misleading.
 
 ---
 
@@ -23,11 +23,6 @@ The raw dataset includes two columns — `diabetes_risk_score` and `diabetes_sta
 
 Trained on an 80/20 split of the 100,000-row dataset, with leakage columns excluded:
 
-| Model | Accuracy |
-|---|---|
-| Random Forest | 92.0% |
-| XGBoost | 91.5% |
-| Logistic Regression | 86.1% |
 | Model               | Accuracy |
 | ------------------- | -------- |
 | Random Forest       | 92.0%    |
@@ -106,7 +101,6 @@ The dataset (`data/diabetes_dataset.csv`) contains 100,000 anonymized patient re
 - **Clinical measurements:** BMI, waist-to-hip ratio, blood pressure, heart rate, cholesterol panel (total/HDL/LDL), triglycerides, fasting/postprandial glucose, insulin level, HbA1c
 - **Target:** `diagnosed_diabetes` (0 = not diagnosed, 1 = diagnosed)
 
-> `diabetes_risk_score` and `diabetes_stage` are excluded from training by default as they are derived from the diagnosis outcome (see *Why this matters* above).
 > `diabetes_risk_score` and `diabetes_stage` are excluded from training by default as they are derived from the diagnosis outcome (see _Why this matters_ above).
 
 ---
@@ -121,4 +115,4 @@ This app is built for educational and portfolio purposes. It is **not a medical 
 
 **Waseem Hassan**
 AI/ML Engineer | Network Infrastructure → Applied ML
-[LinkedIn](https://linkedin.com/in/waseemhassanshk) · [GitHub](https://github.com/Waseem771) · [Kaggle](https://kaggle.com/waseem7711)[LinkedIn](https://linkedin.com/in/waseemhassanshk) · [GitHub](https://github.com/Waseem771) · [Kaggle](https://kaggle.com/waseem7711)
+[LinkedIn](https://linkedin.com/in/waseemhassanshk) · [GitHub](https://github.com/Waseem771) · [Kaggle](https://kaggle.com/waseem7711)
